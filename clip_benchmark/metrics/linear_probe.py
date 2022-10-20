@@ -2,8 +2,11 @@ import os
 import time
 from tqdm import tqdm
 from contextlib import suppress
+from timm.utils import AverageMeter
+
 import torch
 import torch.nn.functional as F
+import wandb
 from torch.utils.data import Dataset, DataLoader, Sampler
 import numpy as np
 from .zeroshot_classification import accuracy
@@ -56,8 +59,24 @@ class FeatureDataset(Dataset):
 
 
 
-def evaluate(model, train_dataloader, dataloader, fewshot_k, batch_size, num_workers, lr, epochs, 
-             model_id, seed, feature_root, device, amp=True, verbose=False):
+def evaluate(
+    model, 
+    train_dataloader, 
+    dataloader, 
+    fewshot_k, 
+    batch_size, 
+    num_workers, 
+    lr, 
+    epochs, 
+    model_id, 
+    seed, 
+    feature_root, 
+    device, 
+    amp=True, 
+    verbose=False, 
+    log_interval: int = 20, 
+    log_wandb: bool = False
+):
     # warning: we currently only support non-multi-label classification datasets.
     assert device == 'cuda' # need to use cuda for this else too slow
     # first we need to featurize the dataset, and store the result in feature_root
@@ -124,18 +143,18 @@ def evaluate(model, train_dataloader, dataloader, fewshot_k, batch_size, num_wor
             torch.save(features, os.path.join(feature_dir, f'features{save_str}.pt'))
             torch.save(targets, os.path.join(feature_dir, f'targets{save_str}.pt'))
 
-    features = torch.load(os.path.join(feature_dir, 'features_train.pt'))
-    targets = torch.load(os.path.join(feature_dir, 'targets_train.pt'))
+    train_features = torch.load(os.path.join(feature_dir, 'features_train.pt'))
+    train_targets = torch.load(os.path.join(feature_dir, 'targets_train.pt'))
 
     # second, make a dataloader with k features per class. if k = -1, use all features.
-    length = len(features)
+    length = len(train_features)
     perm = [p.item() for p in torch.randperm(length)]
     idxs = []
     counts = {}
     num_classes = 0
 
     for p in perm:
-        target = targets[p].item()
+        target = train_targets[p].item()
         if target not in counts:
             counts[target] = 0
             num_classes += 1
@@ -149,17 +168,30 @@ def evaluate(model, train_dataloader, dataloader, fewshot_k, batch_size, num_wor
             print('insufficient data for this eval')
             exit()
 
-    features = features[idxs]
-    targets = targets[idxs]
-    feature_dset = FeatureDataset(features, targets)
-
-    # now train the model
-    feature_loader = DataLoader(feature_dset, batch_size=batch_size, 
-                                    shuffle=True, num_workers=num_workers, 
-                                    pin_memory=True,
-                                )
+    # prepare train data
+    train_features = train_features[idxs]
+    train_targets = train_targets[idxs]
+    train_feature_dset = FeatureDataset(train_features, train_targets)
+    train_feature_loader = DataLoader(
+        train_feature_dset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=num_workers, 
+        pin_memory=True,
+    )
+    # prepare validation data
+    val_features = torch.load(os.path.join(feature_dir, 'features_val.pt'))
+    val_targets = torch.load(os.path.join(feature_dir, 'targets_val.pt'))
+    val_feature_dset = FeatureDataset(val_features, val_targets)
+    val_feature_loader = DataLoader(
+        val_feature_dset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=num_workers, 
+        pin_memory=True,
+    )
     
-    probe = torch.nn.Linear(features[0].shape[0], targets.max().item() + 1)
+    probe = torch.nn.Linear(train_features[0].shape[0], train_targets.max().item() + 1)
     devices = [x for x in range(torch.cuda.device_count())]
     probe = probe.cuda()
     probe = torch.nn.DataParallel(probe, device_ids=devices)
@@ -170,13 +202,18 @@ def evaluate(model, train_dataloader, dataloader, fewshot_k, batch_size, num_wor
     )
     criterion = torch.nn.CrossEntropyLoss()
 
-    len_loader = len(feature_loader)
+    len_loader = len(train_feature_loader)
     scheduler = cosine_lr(optimizer, lr, 0., epochs * len_loader)
 
     for epoch in range(epochs):
+        # create meters
+        loss_m = AverageMeter()
+        lr_m = AverageMeter()
+        # start tick
         end = time.time()
-        for i, (x, y) in enumerate(feature_loader):
-            x, y = x.cuda(), y.cuda()
+        # train epoch
+        for i, (x, y) in enumerate(train_feature_loader):
+            x, y = x.to(device), y.to(device)
             step = i + epoch * len_loader
             scheduler(step)
             data_time = time.time() - end
@@ -192,7 +229,11 @@ def evaluate(model, train_dataloader, dataloader, fewshot_k, batch_size, num_wor
             batch_time = time.time() - end
             end = time.time()
 
-            if (i % 20) == 0:
+            # update meters
+            loss_m.update(loss.item())
+            lr_m.update(optimizer.param_groups[0]['lr'])
+
+            if (i % log_interval) == 0:
                 num_samples = i * len(x)
                 samples_per_epoch = len(train_dataloader)
                 percent_complete = 100.0 * i / len(train_dataloader)
@@ -202,42 +243,55 @@ def evaluate(model, train_dataloader, dataloader, fewshot_k, batch_size, num_wor
                     f"LR {optimizer.param_groups[0]['lr']:.5f}"
                 )
 
-    # finally, evaluate.
-    features = torch.load(os.path.join(feature_dir, 'features_val.pt'))
-    targets = torch.load(os.path.join(feature_dir, 'targets_val.pt'))
-    feature_dset = FeatureDataset(features, targets)
-    feature_loader = DataLoader(feature_dset, batch_size=batch_size, 
-                                    shuffle=True, num_workers=num_workers, 
-                                    pin_memory=True,
-                                )
-    true, pred = [], []
-    with torch.no_grad():
-        for x, y in tqdm(feature_loader):
-            x = x.to(device)
-            y = y.to(device)
+        # eval epoch
+        true, pred = [], []
+        with torch.no_grad():
+            for x, y in tqdm(val_feature_loader):
+                x, y = x.to(device), y.to(device)
 
-            with autocast():
-                # predict
-                logits = probe(x)
+                with autocast():
+                    # predict
+                    logits = probe(x)
 
-            pred.append(logits.cpu())
-            true.append(y.cpu())
-            
-    logits = torch.cat(pred)
-    target = torch.cat(true)
-    pred = logits.argmax(axis=1)
+                pred.append(logits.cpu())
+                true.append(y.cpu())
+                
+        logits = torch.cat(pred)
+        target = torch.cat(true)
+        pred = logits.argmax(axis=1)
 
-    # measure accuracy
-    if target.max() >= 5:
-        acc1, acc5 = accuracy(logits.float(), target.float(), topk=(1, 5))
-    else:
-        acc1, = accuracy(logits.float(), target.float(), topk=(1,))
-        acc5 = float("nan") 
-    mean_per_class_recall = balanced_accuracy_score(target, pred)
-    if verbose:
-        print(classification_report(target, pred, digits=3))
+        # measure accuracy
+        if target.max() >= 5:
+            acc1, acc5 = accuracy(logits.float(), target.float(), topk=(1, 5))
+        else:
+            acc1, = accuracy(logits.float(), target.float(), topk=(1,))
+            acc5 = float("nan") 
+        mean_per_class_recall = balanced_accuracy_score(target, pred)
+        if verbose:
+            print(classification_report(target, pred, digits=3))
+        else:
+            print(
+                f"Eval epoch: {epoch}\t"
+                f"Acc1: {acc1:.3f}\t Mean Recall: {mean_per_class_recall}"
+            )
+
+        if log_wandb:
+            wandb.log({
+                'lp1_acc1': acc1,
+                'lp5_acc5': acc5,
+                'lp_mean_per_class_recall': mean_per_class_recall, 
+                'lr': lr_m.avg, 
+                'train_loss': loss_m.avg
+            })
 
     print('acc1:', acc1)
-    return {"lp_acc1": acc1, "lp_acc5": acc5, "lp_mean_per_class_recall": mean_per_class_recall, 
-            'lr': lr, 'epochs': epochs, 'seed': seed, 'fewshot_k': fewshot_k}
+    return {
+        "lp_acc1": acc1, 
+        "lp_acc5": acc5, 
+        "lp_mean_per_class_recall": mean_per_class_recall, 
+        'lr': lr, 
+        'epochs': epochs, 
+        'seed': seed, 
+        'fewshot_k': fewshot_k
+    }
 
