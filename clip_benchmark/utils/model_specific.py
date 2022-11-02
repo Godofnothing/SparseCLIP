@@ -45,9 +45,9 @@ class LayeredMultiheadAttention(Module):
 
         if self._qkv_same_embed_dim is False: 
             # TODO merge bias in nn.Linear in future releases
-            self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False, **factory_kwargs)
-            self.k_proj = nn.Linear(embed_dim, self.kdim, bias=False, **factory_kwargs)
-            self.v_proj = nn.Linear(embed_dim, self.vdim, bias=False, **factory_kwargs)
+            self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
+            self.k_proj = nn.Linear(embed_dim, self.kdim, bias=bias, **factory_kwargs)
+            self.v_proj = nn.Linear(embed_dim, self.vdim, bias=bias, **factory_kwargs)
         else:
             self.in_proj = nn.Linear(3 * embed_dim, embed_dim, bias=bias, **factory_kwargs)
 
@@ -60,6 +60,8 @@ class LayeredMultiheadAttention(Module):
             self.bias_k = self.bias_v = None
 
         self.add_zero_attn = add_zero_attn
+
+        self.scale = self.head_dim ** -0.5
 
         self._reset_parameters()
 
@@ -84,7 +86,7 @@ class LayeredMultiheadAttention(Module):
         if '_qkv_same_embed_dim' not in state:
             state['_qkv_same_embed_dim'] = True
 
-        super(MultiheadAttention, self).__setstate__(state)
+        super(LayeredMultiheadAttention, self).__setstate__(state)
 
     def forward(self, query: Tensor, key: Tensor, value: Tensor, key_padding_mask: Optional[Tensor] = None,
                 need_weights: bool = True, attn_mask: Optional[Tensor] = None,
@@ -203,7 +205,8 @@ class LayeredMultiheadAttention(Module):
                     self.out_proj.bias,
                     key_padding_mask if key_padding_mask is not None else attn_mask,
                     need_weights,
-                    average_attn_weights)
+                    average_attn_weights
+                )
         any_nested = query.is_nested or key.is_nested or value.is_nested
         assert not any_nested, ("MultiheadAttention does not support NestedTensor outside of its fast path. " +
                                 f"The fast path was not hit because {why_not_fast_path}")
@@ -219,26 +222,24 @@ class LayeredMultiheadAttention(Module):
             else:
                 query, key, value = [x.transpose(1, 0) for x in (query, key, value)]
 
+        N, B = query.shape[:2]
         if not self._qkv_same_embed_dim:
-            attn_output, attn_output_weights = F.multi_head_attention_forward(
-                query, key, value, self.embed_dim, self.num_heads,
-                self.in_proj.weight, self.in_proj.bias,
-                self.bias_k, self.bias_v, self.add_zero_attn,
-                self.dropout, self.out_proj.weight, self.out_proj.bias,
-                training=self.training,
-                key_padding_mask=key_padding_mask, need_weights=need_weights,
-                attn_mask=attn_mask, use_separate_proj_weight=True,
-                q_proj_weight=self.q_proj.weight, k_proj_weight=self.k_proj.weight,
-                v_proj_weight=self.v_proj.weight, average_attn_weights=average_attn_weights)
+            query = self.q_proj(query).reshape(N, B, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            key = self.k_proj(key).reshape(N, B, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            value = self.v_proj(value).reshape(N, B, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         else:
-            attn_output, attn_output_weights = F.multi_head_attention_forward(
-                query, key, value, self.embed_dim, self.num_heads,
-                self.in_proj.weight, self.in_proj.bias,
-                self.bias_k, self.bias_v, self.add_zero_attn,
-                self.dropout, self.out_proj.weight, self.out_proj.bias,
-                training=self.training,
-                key_padding_mask=key_padding_mask, need_weights=need_weights,
-                attn_mask=attn_mask, average_attn_weights=average_attn_weights)
+            qkv = self.in_proj(query).reshape(
+                N, B, 3, self.num_heads, self.head_dim).permute(2, 1, 3, 0, 4)
+            query, key, value = qkv.unbind(0)  
+        
+        attn_output_weights = (query @ key.transpose(-2, -1)) * self.scale
+        attn_output_weights = attn_output_weights.softmax(dim=-1)
+        if self.dropout > 0:
+          attn_output_weights = F.dropout(attn_output_weights, self.dropout)
+
+        # value = B, num_heads, L, head_dim
+        attn_output = (attn_output_weights @ value).permute(2, 0, 1, 3).reshape(N, B, -1)
+        attn_output = self.out_proj(attn_output)
         if self.batch_first and is_batched:
             return attn_output.transpose(1, 0), attn_output_weights
         else:
@@ -271,11 +272,16 @@ def fix_attention_layer(model: nn.Module):
                     if proj_weight is not None:
                         getattr(attention, f"{proj_name}_proj").weight.data = proj_weight
                 if bias:
-                    attention.in_proj.bias.data = module.in_proj_bias
-                # bias for k, v layers exists or doesn't exist simultaneously
+                    if not module._qkv_same_embed_dim:
+                      q_bias, k_bias, v_bias = module.in_proj_bias.chunk(3)
+                      attention.q_proj.data = q_bias
+                      attention.k_proj.data = k_bias
+                      attention.v_proj.data = v_bias
+                    else:
+                      attention.in_proj.bias.data = module.in_proj_bias
                 if add_bias_kv:
-                    attention.bias_k.data = module.bias_k
-                    attention.bias_v.data = module.bias_v
+                  attention.bias_k.data = module.bias_k
+                  attention.bias_v.data = module.bias_v
                 if module.out_proj.weight is not None:
                     attention.out_proj.weight.data = module.out_proj.weight.data
                 if module.out_proj.bias is not None:
@@ -285,3 +291,4 @@ def fix_attention_layer(model: nn.Module):
             parent_module = model.get_submodule(parent_name)
             setattr(parent_module, name, attention)
     return model
+     

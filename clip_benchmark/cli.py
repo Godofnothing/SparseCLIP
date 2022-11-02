@@ -1,4 +1,5 @@
 """Console script for clip_benchmark."""
+import os
 import argparse
 import sys
 import json
@@ -10,6 +11,7 @@ from datasets.builder import build_dataset, get_dataset_collate_fn, get_zeroshot
 from metrics import zeroshot_classification, zeroshot_retrieval, linear_probe
 
 from torch.utils.data import default_collate
+from utils.model_specific import fix_attention_layer
 
 def main():
     parser = argparse.ArgumentParser()
@@ -17,6 +19,7 @@ def main():
     parser.add_argument('--split', type=str, default="test", help="Dataset split to use")
     parser.add_argument('--model', type=str, default="ViT-B-32-quickgelu", help="Model architecture to use from OpenCLIP")
     parser.add_argument('--pretrained', type=str, default="laion400m_e32", help="Model checkpoint name to use from OpenCLIP")
+    parser.add_argument('--checkpoint_path', type=str, default=None, help="Path to model checkpoint")
     parser.add_argument('--task', type=str, default="zeroshot_classification", choices=["zeroshot_classification", "zeroshot_retrieval", "linear_probe"])
     parser.add_argument('--amp', default=True, action="store_true", help="whether to use mixed precision")
     parser.add_argument('--num_workers', default=4, type=int)
@@ -34,6 +37,10 @@ def main():
     parser.add_argument('--verbose', default=False, action="store_true", help="verbose mode")
     parser.add_argument('--log_wandb', default=False, action="store_true", help="Log to W&B")
     parser.add_argument('--log_interval', default=20, type=int, help="Logging interval")
+    # Misc params
+    parser.add_argument('--fix_attention_layer', action='store_true', 
+                        help='Set True to make attention layer SparseML friendly.')
+
     args = parser.parse_args()
     run(args)
     
@@ -50,6 +57,12 @@ def run(args):
         model, transform, collate_fn, dataloader = None, None, None, None
     else:
         model, _, transform = open_clip.create_model_and_transforms(args.model, pretrained=args.pretrained)
+        # fix model
+        if args.fix_attention_layer:
+            model = fix_attention_layer(model)
+        # replace by pretrained
+        if args.checkpoint_path is not None:
+            model.visual.load_state_dict(torch.load(args.checkpoint_path))
         model = model.to(args.device)
         dataset = build_dataset(
             dataset_name=args.dataset, 
@@ -139,6 +152,9 @@ def run(args):
         "task": args.task,
         "metrics": metrics
     }
+    # makedirs (if needed)
+    output_dir = os.sep.join(args.output.split(os.sep)[:-1])
+    os.makedirs(output_dir, exist_ok=True)
     with open(args.output, "w") as f:
         json.dump(dump, f)
     return 0

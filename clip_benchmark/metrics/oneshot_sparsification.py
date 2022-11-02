@@ -147,3 +147,4 @@ def oneshot_sparsification(
         finalize=True
     )
     # save resulting model
+    torch.save(model.state_dict(), os.path.join(output_dir, 'checkpoint.pth'))
