@@ -1,0 +1,26 @@
+pruning_modifiers:
+
+  - !FastOBCPruningModifier
+    params: ['re:.*transformer.resblocks.\d+.(attn.(in|out)_proj|mlp.c_(fc|proj)).*weight']
+    init_sparsity: 0.5
+    final_sparsity: 0.5
+    start_epoch: 0
+    end_epoch: 1
+    update_frequency: 1
+    mask_type: unstructured
+    global_sparsity: False
+    # One can prune sequentially
+    sequential_pruning: True
+    # OBC kwargs
+    damp: 1e-6
+    num_calibration_samples: 1000
+    block_size: 128
+    store_database_on_drive: False
+    # SPDY kwargs
+    use_spdy: False
+    # base storage dir
+    storage_dir: fast_obc_storage
+    # caching properties
+    cache_inputs: True
+    layer_calibration_batch_size: null
+    cache_size: null

@@ -1,17 +1,19 @@
 import os
 import time
-from tqdm import tqdm
-from contextlib import suppress
-from timm.utils import AverageMeter
-
+import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
-from torch.utils.data import Dataset, DataLoader, Sampler
-import numpy as np
-from .zeroshot_classification import accuracy
 
+from typing import Optional
+from tqdm import tqdm
+from contextlib import suppress
+from timm.utils import AverageMeter
+from torch.utils.data import Dataset, DataLoader, Sampler
 from sklearn.metrics import classification_report, balanced_accuracy_score
+from sparseml.pytorch.optim import ScheduledModifierManager
+
+from .zeroshot_classification import accuracy
 
 def assign_learning_rate(param_group, new_lr):
     param_group["lr"] = new_lr
@@ -58,7 +60,6 @@ class FeatureDataset(Dataset):
         return self.features[i], self.targets[i]
 
 
-
 def evaluate(
     model, 
     train_dataloader, 
@@ -75,17 +76,18 @@ def evaluate(
     amp=True, 
     verbose=False, 
     log_interval: int = 20, 
-    log_wandb: bool = False
+    log_wandb: bool = False,
+    # sparseml params
+    sparseml_recipe_path: Optional[str] = None,
 ):
     # warning: we currently only support non-multi-label classification datasets.
     assert device == 'cuda' # need to use cuda for this else too slow
     # first we need to featurize the dataset, and store the result in feature_root
     if not os.path.exists(feature_root):
-        os.mkdir(feature_root)
+        os.makedirs(feature_root)
     feature_dir = os.path.join(feature_root, model_id)
     if not os.path.exists(feature_dir):
         os.mkdir(feature_dir)
-
     
     featurizer = Featurizer(model).cuda()
     autocast = torch.cuda.amp.autocast if amp else suppress
@@ -202,6 +204,16 @@ def evaluate(
     )
     criterion = torch.nn.CrossEntropyLoss()
 
+    # modify optimizer
+    if sparseml_recipe_path is not None:
+        manager = ScheduledModifierManager.from_yaml(sparseml_recipe_path)
+        optimizer = manager.modify(
+            model, 
+            optimizer, 
+            epoch=0, 
+            steps_per_epoch=len(train_feature_loader)
+        )
+
     len_loader = len(train_feature_loader)
     scheduler = cosine_lr(optimizer, lr, 0., epochs * len_loader)
 
@@ -235,8 +247,8 @@ def evaluate(
 
             if (i % log_interval) == 0:
                 num_samples = i * len(x)
-                samples_per_epoch = len(train_dataloader)
-                percent_complete = 100.0 * i / len(train_dataloader)
+                samples_per_epoch = len(train_feature_dset)
+                percent_complete = 100.0 * i / len(train_feature_loader)
                 print(
                     f"Train Epoch: {epoch} [{num_samples}/{samples_per_epoch} ({percent_complete:.0f}%)]\t"
                     f"Loss: {loss.item():.6f}\tData (t) {data_time:.3f}\tBatch (t) {batch_time:.3f}\t"

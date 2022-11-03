@@ -37,6 +37,8 @@ def main():
     parser.add_argument('--verbose', default=False, action="store_true", help="verbose mode")
     parser.add_argument('--log_wandb', default=False, action="store_true", help="Log to W&B")
     parser.add_argument('--log_interval', default=20, type=int, help="Logging interval")
+    # SparseML parameters
+    parser.add_argument('--sparseml_recipe_path', type=str, default=None, help="Path to SparseML recipe used as a template")
     # Misc params
     parser.add_argument('--fix_attention_layer', action='store_true', 
                         help='Set True to make attention layer SparseML friendly.')
@@ -62,6 +64,7 @@ def run(args):
             model = fix_attention_layer(model)
         # replace by pretrained
         if args.checkpoint_path is not None:
+            print(f"Loading checkpoint from {args.checkpoint_path}")
             model.visual.load_state_dict(torch.load(args.checkpoint_path))
         model = model.to(args.device)
         dataset = build_dataset(
@@ -140,7 +143,8 @@ def run(args):
             amp=args.amp,
             verbose=args.verbose,
             log_interval=args.log_interval,
-            log_wandb=args.log_wandb
+            log_wandb=args.log_wandb,
+            sparseml_recipe_path=args.sparseml_recipe_path
         )
     else:
         raise ValueError("Unsupported task: {}. task should `zeroshot_classification` or `zeroshot_retrieval`".format(args.task))

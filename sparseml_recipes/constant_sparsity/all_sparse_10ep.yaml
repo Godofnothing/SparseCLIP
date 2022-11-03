@@ -1,0 +1,6 @@
+pruning_modifiers:
+
+  - !ConstantPruningModifier
+    params: __ALL_PRUNABLE__
+    start_epoch: 0
+    end_epoch: 10
