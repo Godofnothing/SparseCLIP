@@ -8,7 +8,6 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 from functools import partial
 from contextlib import suppress
 from typing import List, Optional
@@ -31,6 +30,7 @@ def get_fewshot_indices(train_dataset, fewshot_k):
     fewshot_indices = sum([ids.tolist() for _, ids in class2ids.items()], [])
     return fewshot_indices
 
+
 # TODO add option of loading to drive?
 @torch.no_grad()
 def gather_inputs_and_outputs(model, loader, device, autocast=suppress):
@@ -42,37 +42,40 @@ def gather_inputs_and_outputs(model, loader, device, autocast=suppress):
 
         with autocast():
             outputs = model(inputs)
-        
+
         all_inputs.append(inputs.cpu())
         all_outputs.append(outputs.cpu())
 
     return (
-        torch.cat(all_inputs, dim=0), 
+        torch.cat(all_inputs, dim=0),
         torch.cat(all_outputs, dim=0)
     )
-        
+
+
 '''
 TODO add option of not using calibration dataset. 
 TODO add OBS support.
 '''
+
+
 def oneshot_sparsification(
-    # model
-    model, 
-    # data
-    dataset, 
-    # model props
-    model_id: str, 
-    output_root: str, 
-    device: str, 
-    # few shot params
-    fewshot_k: int,
-    # sparseml params
-    sparseml_recipe_path: str,
-    # dataloader params
-    calibration_batch_size: Optional[int] = None, 
-    num_workers: Optional[int] = 1,
-    amp: bool = True,
-    loss: str = 'mse',
+        # model
+        model,
+        # data
+        dataset,
+        # model props
+        model_id: str,
+        output_root: str,
+        device: str,
+        # few shot params
+        fewshot_k: int,
+        # sparseml params
+        sparseml_recipe_path: str,
+        # dataloader params
+        calibration_batch_size: Optional[int] = None,
+        num_workers: Optional[int] = 1,
+        amp: bool = True,
+        loss: str = 'mse',
 ) -> None:
     output_dir = os.path.join(output_root, model_id)
     if not os.path.exists(output_dir):
@@ -90,10 +93,10 @@ def oneshot_sparsification(
 
     # create dataloaders
     dataloader = DataLoader(
-        fewshot_dataset, 
+        fewshot_dataset,
         # TODO try different batch size?
-        batch_size=calibration_batch_size, 
-        shuffle=True, 
+        batch_size=calibration_batch_size,
+        shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
     )
@@ -108,9 +111,9 @@ def oneshot_sparsification(
 
     io_dataset = TensorDataset(model_inputs, model_outputs)
     io_loader = DataLoader(
-        io_dataset, 
-        batch_size=calibration_batch_size, 
-        shuffle=True, 
+        io_dataset,
+        batch_size=calibration_batch_size,
+        shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
     )
@@ -142,7 +145,7 @@ def oneshot_sparsification(
     manager = ScheduledModifierManager.from_yaml(sparseml_recipe_path)
     # apply recipe
     manager.apply(
-        model, 
+        model,
         **manager_kwargs,
         finalize=True
     )
