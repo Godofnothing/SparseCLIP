@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from open_clip.modified_resnet import AttentionPool2d
 
 from torch import Tensor
 from torch.nn import Module, Parameter
@@ -9,28 +10,28 @@ from typing import Optional, Tuple, List
 from torch.nn.functional import _mha_shape_check, _scaled_dot_product_attention
 from torch.nn.modules.activation import MultiheadAttention
 
-
 __all__ = [
     "LayeredMultiheadAttention",
-    "fix_attention_layer"
+    'LayeredAttentionPool2d',
+    "fix_attention_layer",
 ]
 
 
 class LayeredMultiheadAttention(Module):
 
     def __init__(
-        self, 
-        embed_dim, 
-        num_heads, 
-        dropout=0.0, 
-        bias=True, 
-        add_bias_kv=False, 
-        add_zero_attn=False,
-        kdim=None, 
-        vdim=None, 
-        batch_first=False, 
-        device=None,
-        dtype=None
+            self,
+            embed_dim,
+            num_heads,
+            dropout=0.0,
+            bias=True,
+            add_bias_kv=False,
+            add_zero_attn=False,
+            kdim=None,
+            vdim=None,
+            batch_first=False,
+            device=None,
+            dtype=None
     ) -> None:
         factory_kwargs = {'device': device, 'dtype': dtype}
         super(LayeredMultiheadAttention, self).__init__()
@@ -50,7 +51,7 @@ class LayeredMultiheadAttention(Module):
         self.k_proj = None
         self.v_proj = None
         self.in_proj = None
-        if self._qkv_same_embed_dim is False: 
+        if self._qkv_same_embed_dim is False:
             self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
             self.k_proj = nn.Linear(embed_dim, self.kdim, bias=bias, **factory_kwargs)
             self.v_proj = nn.Linear(embed_dim, self.vdim, bias=bias, **factory_kwargs)
@@ -175,44 +176,126 @@ class LayeredMultiheadAttention(Module):
                     value = key
             else:
                 query, key, value = [x.transpose(1, 0) for x in (query, key, value)]
-                
+
         attn_output, attn_output_weights = multi_head_attention_forward_layered(
-            query=query, 
-            key=key, 
-            value=value, 
-            embed_dim_to_check=self.embed_dim, 
+            query=query,
+            key=key,
+            value=value,
+            embed_dim_to_check=self.embed_dim,
             num_heads=self.num_heads,
-            q_proj=self.q_proj, 
+            q_proj=self.q_proj,
             k_proj=self.k_proj,
-            v_proj=self.v_proj, 
+            v_proj=self.v_proj,
             out_proj=self.out_proj,
             in_proj=self.in_proj,
-            bias_k=self.bias_k, 
-            bias_v=self.bias_v, 
+            bias_k=self.bias_k,
+            bias_v=self.bias_v,
             add_zero_attn=self.add_zero_attn,
-            dropout_p=self.dropout, 
+            dropout_p=self.dropout,
             training=self.training,
-            key_padding_mask=key_padding_mask, 
+            key_padding_mask=key_padding_mask,
             need_weights=need_weights,
-            attn_mask=attn_mask, 
+            attn_mask=attn_mask,
             use_separate_proj_weight=not self._qkv_same_embed_dim,
             average_attn_weights=average_attn_weights
         )
-   
+
         if self.batch_first and is_batched:
             return attn_output.transpose(1, 0), attn_output_weights
         else:
             return attn_output, attn_output_weights
 
-#
-# in_projections
-#
+    @classmethod
+    def from_multihead_attention(cls, module: MultiheadAttention):
+        bias = module.in_proj_bias is not None
+        add_bias_kv = module.bias_k is not None
+
+        attention = cls(
+            module.embed_dim,
+            module.num_heads,
+            module.dropout,
+            bias=bias,
+            add_bias_kv=add_bias_kv,
+            add_zero_attn=module.add_zero_attn,
+            kdim=module.kdim,
+            vdim=module.vdim,
+            batch_first=module.batch_first
+        )
+
+        # copy weights and biases
+        with torch.no_grad():
+            for proj_name in ['in', 'out', 'q', 'k', 'v']:
+                proj_weight = module.state_dict().get(f"{proj_name}_proj_weight")
+                if proj_weight is not None:
+                    getattr(attention, f"{proj_name}_proj").weight.data = proj_weight
+            attention.out_proj.weight.data = module.out_proj.weight.data
+            if bias:
+                if module._qkv_same_embed_dim:
+                    attention.in_proj.bias.data = module.in_proj_bias
+                else:
+                    b_q, b_k, b_v = module.in_proj_bias.chunk(3)
+                    attention.q_proj.bias.data = b_q
+                    attention.k_proj.bias.data = b_k
+                    attention.v_proj.bias.data = b_v
+                attention.out_proj.bias.data = module.out_proj.bias.data
+            # bias for k, v layers exists or doesn't exist simultaneously
+            if add_bias_kv:
+                attention.bias_k.data = module.bias_k
+                attention.bias_v.data = module.bias_v
+        return attention
+
+
+class LayeredAttentionPool2d(nn.Module):
+    def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
+        super().__init__()
+        self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.c_proj = nn.Linear(embed_dim, output_dim or embed_dim)
+        self.num_heads = num_heads
+
+    def forward(self, x):
+        x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3]).permute(2, 0, 1)  # NCHW -> (HW)NC
+        x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
+        x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
+        x, _ = multi_head_attention_forward_layered(
+            query=x, key=x, value=x,
+            embed_dim_to_check=x.shape[-1],
+            num_heads=self.num_heads,
+            q_proj=self.q_proj,
+            k_proj=self.k_proj,
+            v_proj=self.v_proj,
+            in_proj=None,
+            bias_k=None,
+            bias_v=None,
+            add_zero_attn=False,
+            dropout_p=0,
+            out_proj=self.c_proj,
+            use_separate_proj_weight=True,
+            training=self.training,
+            need_weights=False
+        )
+
+        return x[0]
+
+    @classmethod
+    def from_attention_pool_2d(cls, module: AttentionPool2d):
+        attention = cls(1, module.k_proj.in_features, module.num_heads, module.c_proj.out_features)
+        state_dict = module.state_dict()
+        with torch.no_grad():
+            for proj_name in ['q', 'k', 'v', 'c']:
+                getattr(attention, f'{proj_name}_proj').weight.data = state_dict.get(f'{proj_name}_proj.weight')
+                getattr(attention, f'{proj_name}_proj').bias.data = state_dict.get(f'{proj_name}_proj.bias')
+            attention.positional_embedding.data = state_dict.get('positional_embedding')
+        return attention
+
 
 def _in_projection_packed(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    in_proj: nn.Linear, 
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        in_proj: nn.Linear,
 ) -> List[Tensor]:
     r"""
     Performs the in-projection step of the attention operation, using packed weights.
@@ -244,30 +327,29 @@ def _in_projection_packed(
 
 
 def multi_head_attention_forward_layered(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    embed_dim_to_check: int,
-    num_heads: int,
-    out_proj: nn.Linear,
-    in_proj: Optional[nn.Linear] = None,
-    q_proj: Optional[nn.Linear] = None,
-    k_proj: Optional[nn.Linear] = None,
-    v_proj: Optional[nn.Linear] = None,
-    bias_k: Optional[Tensor] = None,
-    bias_v: Optional[Tensor] = None,
-    add_zero_attn: bool = False,
-    dropout_p: float = 0.0,
-    training: bool = True,
-    key_padding_mask: Optional[Tensor] = None,
-    need_weights: bool = True,
-    attn_mask: Optional[Tensor] = None,
-    use_separate_proj_weight: bool = False,
-    static_k: Optional[Tensor] = None,
-    static_v: Optional[Tensor] = None,
-    average_attn_weights: bool = True,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        embed_dim_to_check: int,
+        num_heads: int,
+        out_proj: nn.Linear,
+        in_proj: Optional[nn.Linear] = None,
+        q_proj: Optional[nn.Linear] = None,
+        k_proj: Optional[nn.Linear] = None,
+        v_proj: Optional[nn.Linear] = None,
+        bias_k: Optional[Tensor] = None,
+        bias_v: Optional[Tensor] = None,
+        add_zero_attn: bool = False,
+        dropout_p: float = 0.0,
+        training: bool = True,
+        key_padding_mask: Optional[Tensor] = None,
+        need_weights: bool = True,
+        attn_mask: Optional[Tensor] = None,
+        use_separate_proj_weight: bool = False,
+        static_k: Optional[Tensor] = None,
+        static_v: Optional[Tensor] = None,
+        average_attn_weights: bool = True,
 ) -> Tuple[Tensor, Optional[Tensor]]:
-
     is_batched = _mha_shape_check(query, key, value, key_padding_mask, attn_mask, num_heads)
 
     # For unbatched input, we unsqueeze at the expected batch-dim to pretend that the input
@@ -323,12 +405,14 @@ def multi_head_attention_forward_layered(
         if attn_mask.dim() == 2:
             correct_2d_size = (tgt_len, src_len)
             if attn_mask.shape != correct_2d_size:
-                raise RuntimeError(f"The shape of the 2D attn_mask is {attn_mask.shape}, but should be {correct_2d_size}.")
+                raise RuntimeError(
+                    f"The shape of the 2D attn_mask is {attn_mask.shape}, but should be {correct_2d_size}.")
             attn_mask = attn_mask.unsqueeze(0)
         elif attn_mask.dim() == 3:
             correct_3d_size = (bsz * num_heads, tgt_len, src_len)
             if attn_mask.shape != correct_3d_size:
-                raise RuntimeError(f"The shape of the 3D attn_mask is {attn_mask.shape}, but should be {correct_3d_size}.")
+                raise RuntimeError(
+                    f"The shape of the 3D attn_mask is {attn_mask.shape}, but should be {correct_3d_size}.")
         else:
             raise RuntimeError(f"attn_mask's dimension {attn_mask.dim()} is not supported")
 
@@ -391,7 +475,7 @@ def multi_head_attention_forward_layered(
     if key_padding_mask is not None:
         assert key_padding_mask.shape == (bsz, src_len), \
             f"expecting key_padding_mask shape of {(bsz, src_len)}, but got {key_padding_mask.shape}"
-        key_padding_mask = key_padding_mask.view(bsz, 1, 1, src_len).   \
+        key_padding_mask = key_padding_mask.view(bsz, 1, 1, src_len). \
             expand(-1, num_heads, -1, -1).reshape(bsz * num_heads, 1, src_len)
         if attn_mask is None:
             attn_mask = key_padding_mask
@@ -435,48 +519,19 @@ def multi_head_attention_forward_layered(
             attn_output = attn_output.squeeze(1)
         return attn_output, None
 
+
 @torch.no_grad()
 def fix_attention_layer(model: nn.Module):
     for module_name, module in model.named_modules():
         if isinstance(module, MultiheadAttention):
-            bias = module.in_proj_bias is not None
-            add_bias_kv = module.bias_k is not None
-
-            attention = LayeredMultiheadAttention(
-                module.embed_dim,
-                module.num_heads,
-                module.dropout,
-                bias=bias,
-                add_bias_kv=add_bias_kv,
-                add_zero_attn=module.add_zero_attn,
-                kdim=module.kdim,
-                vdim=module.vdim,
-                batch_first=module.batch_first
-            )
-
-            # copy weights and biases
-            with torch.no_grad():
-                for proj_name in ['in', 'out', 'q', 'k', 'v']:
-                    proj_weight = module.state_dict().get(f"{proj_name}_proj_weight")
-                    if proj_weight is not None:
-                        getattr(attention, f"{proj_name}_proj").weight.data = proj_weight
-                attention.out_proj.weight.data = module.out_proj.weight.data
-                if bias:
-                    if module._qkv_same_embed_dim:
-                      attention.in_proj.bias.data = module.in_proj_bias
-                    else:
-                      b_q, b_k, b_v = module.in_proj_bias.chunk(3)
-                      attention.q_proj.bias.data = b_q
-                      attention.k_proj.bias.data = b_k
-                      attention.v_proj.bias.data = b_v
-                    attention.out_proj.bias.data = module.out_proj.bias.data
-                # bias for k, v layers exists or doesn't exist simultaneously
-                if add_bias_kv:
-                    attention.bias_k.data = module.bias_k
-                    attention.bias_v.data = module.bias_v
-                    
-            # get parent module
+            module = LayeredMultiheadAttention.from_multihead_attention(module)
+        if isinstance(module, AttentionPool2d):
+            module = LayeredAttentionPool2d.from_attention_pool_2d(module)
+        # get parent module
+        if '.' in module_name:
             parent_name, name = module_name.rsplit('.', 1)
             parent_module = model.get_submodule(parent_name)
-            setattr(parent_module, name, attention)
+            setattr(parent_module, name, module)
+        elif module_name:
+            setattr(model, module_name, module)
     return model
