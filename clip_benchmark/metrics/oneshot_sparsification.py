@@ -132,9 +132,9 @@ def oneshot_sparsification(
         raise ValueError('Unknown function.')
 
     manager_kwargs = dict(
-        obc_kwargs = {
-            'data_loader_builder' : data_loader_builder, 
-            'loss_fn' : loss_fn,
+        calibration_sampler={
+            'data_loader_builder': data_loader_builder,
+            'loss_fn': loss_fn,
         },
     )
 
