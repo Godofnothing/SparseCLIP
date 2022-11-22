@@ -103,6 +103,8 @@ def run(args):
             amp=args.amp,
             verbose=args.verbose,
         )
+        if args.log_wandb:
+            wandb.log(metrics)
     elif args.task == "zeroshot_retrieval":
         metrics = zeroshot_retrieval.evaluate(
             model, 
@@ -112,6 +114,8 @@ def run(args):
             device=args.device, 
             amp=args.amp
         )
+        if args.log_wandb:
+            wandb.log(metrics)
     elif args.task == "linear_probe":
         # we also need the train split for linear probing.
         train_dataset = build_dataset(

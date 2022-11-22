@@ -1,0 +1,19 @@
+pruning_modifiers:
+
+  - !oViTPruningModifier
+    params: ['re:.*transformer.resblocks.\d+.(attn.(in|out)_proj|mlp.c_(fc|proj)).*weight']
+    init_sparsity: 0.5
+    final_sparsity: 0.5
+    start_epoch: 0
+    end_epoch: 1
+    update_frequency: 1
+    mask_type: unstructured
+    global_sparsity: True
+    # OBC kwargs
+    damp: 1e-8
+    num_grads: 1024
+    fisher_block_size: 192
+    blocks_in_parallel: 192
+    store_database_on_drive: False
+    # SPDY kwargs
+    use_spdy: False

@@ -16,8 +16,12 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from sparseml.pytorch.optim import ScheduledModifierManager
 
-from .linear_probe import Featurizer, FeatureDataset
-from .zeroshot_classification import accuracy
+from ..metrics.linear_probe import Featurizer, FeatureDataset
+from ..metrics.zeroshot_classification import accuracy
+
+__all__ = [
+    "evaluate"
+]
 
 
 def extract_features(

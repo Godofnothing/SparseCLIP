@@ -1,14 +1,15 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from open_clip.modified_resnet import AttentionPool2d
 
 from torch import Tensor
 from torch.nn import Module, Parameter
 from typing import Optional, Tuple, List
 
+from open_clip.modified_resnet import AttentionPool2d
 from torch.nn.functional import _mha_shape_check, _scaled_dot_product_attention
 from torch.nn.modules.activation import MultiheadAttention
+
 
 __all__ = [
     "LayeredMultiheadAttention",

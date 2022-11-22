@@ -7,8 +7,8 @@ import wandb
 import argparse
 import open_clip
 
-from datasets.builder import build_dataset, get_dataset_collate_fn, get_zeroshot_classification_templates
-from metrics import linear_probe_sparse
+from datasets.builder import build_dataset, get_dataset_collate_fn
+from clip_benchmark.sparsification import sparse_linear_probing
 
 
 def main():
@@ -17,10 +17,9 @@ def main():
     parser.add_argument('--split', type=str, default="test", help="Dataset split to use")
     parser.add_argument('--model', type=str, default="ViT-B-32-quickgelu", help="Model architecture to use from OpenCLIP")
     parser.add_argument('--pretrained', type=str, default="laion400m_e32", help="Model checkpoint name to use from OpenCLIP")
-    parser.add_argument('--task', type=str, default="zeroshot_classification", choices=["zeroshot_classification", "zeroshot_retrieval", "linear_probe"])
+    parser.add_argument('--task', type=str, default="zeroshot_classification", choices=["linear_probe"])
     parser.add_argument('--amp', default=True, action="store_true", help="whether to use mixed precision")
     parser.add_argument('--num_workers', default=4, type=int)
-    # TODO parser.add_argument('--recall_k', default=[5], type=int, help="for retrieval, select the k for Recall@K metric. ", nargs="+",)
     # Few shot params
     parser.add_argument('--fewshot_k', default=-1, type=int, help="for linear probe, how many shots. -1 = whole dataset.")
     parser.add_argument('--fewshot_lr', default=0.1, type=float, help="for linear probe, what is the learning rate.")
@@ -73,11 +72,7 @@ def run(args):
         print(f"Dataset classes: {val_dataset.classes}")
         print(f"Dataset number of classes: {len(val_dataset.classes)}")
 
-    if args.task == "zeroshot_classification":
-        raise NotImplementedError("Not implemented at the moment.")
-    elif args.task == "zeroshot_retrieval":
-        raise NotImplementedError("Not implemented at the moment.")
-    elif args.task == "linear_probe":
+    if args.task == "linear_probe":
         # we also need the train split for linear probing.
         train_dataset = build_dataset(
             dataset_name=args.dataset, 
@@ -88,7 +83,7 @@ def run(args):
             download=True,
         )
 
-        metrics = linear_probe_sparse.evaluate(
+        metrics = sparse_linear_probing.evaluate(
             model,
             val_dataset=val_dataset,
             train_dataset=train_dataset,
